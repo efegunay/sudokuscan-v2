@@ -17,6 +17,12 @@ import numpy as np
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 
+# Stage 1 parameters. Sizes are fractions of the working image width, so the same values
+# work for a 1000 px and a 4000 px photograph.
+WORK_LONG_SIDE = 1200      # px; larger inputs are downscaled to this before corner detection
+BLUR_FRAC = 0.003          # Gaussian denoising kernel  (~3.6 px at 1200 px)
+BACKGROUND_FRAC = 0.02     # closing kernel for the paper background (~24 px), wider than any ink stroke
+
 
 # MARK: - Exceptions
 
@@ -26,9 +32,49 @@ class PuzzleNotFound(Exception):
 
 # MARK: - Stage 1: Preprocessing
 
+def odd_kernel(fraction, width, minimum=3):
+    """Odd kernel size equal to `fraction` of `width` (OpenCV blur kernels must be odd)."""
+    size = max(minimum, int(round(fraction * width)))
+    return size if size % 2 == 1 else size + 1
+
+
 def preprocess(image_bgr):
-    """Greyscale, denoise, normalise illumination. Returns (prepared_image, scale)."""
-    raise NotImplementedError("Stage 1")
+    """Greyscale, denoise, normalise illumination. Returns (prepared_image, scale).
+
+    `prepared` is a uint8 greyscale image of the downscaled photo where the paper is
+    close to white (255) everywhere, even under a shadow, and ink stays dark.
+    `scale` = working size / original size; divide working coordinates by it to get
+    original-image coordinates.
+    """
+    # 1) Downscale: Harris and the later stages do not need 12 megapixels, and a fixed
+    #    working size keeps the runtime far below the 20 s limit.
+    h, w = image_bgr.shape[:2]
+    scale = min(1.0, WORK_LONG_SIDE / max(h, w))
+    if scale < 1.0:
+        image_bgr = cv2.resize(image_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+
+    # 2) Greyscale: corners and digits are defined by brightness, not colour.
+    grey = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    width = grey.shape[1]
+
+    # 3) Denoise: a small Gaussian removes sensor noise and JPEG blocks that Harris
+    #    would otherwise report as tiny corners.
+    k = odd_kernel(BLUR_FRAC, width)
+    grey = cv2.GaussianBlur(grey, (k, k), 0)
+
+    # 4) Background estimate: a morphological closing (dilate, then erode) with a kernel
+    #    wider than any ink stroke erases the dark ink and keeps the paper brightness,
+    #    including shadows and gradients. Blurring smooths the blocky closing result.
+    kb = odd_kernel(BACKGROUND_FRAC, width)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kb, kb))
+    background = cv2.morphologyEx(grey, cv2.MORPH_CLOSE, kernel)
+    background = cv2.GaussianBlur(background, (kb, kb), 0)
+
+    # 5) Flat-field: divide by the background. Paper becomes ~1.0 everywhere, ink stays
+    #    a fraction of it, so a shadow no longer changes how dark the ink looks.
+    flat = grey.astype(np.float32) / np.maximum(background.astype(np.float32), 1.0)
+    prepared = np.clip(flat * 255.0, 0, 255).astype(np.uint8)
+    return prepared, scale
 
 
 # MARK: - Stage 2: Harris corners + corner selection (written by Efe)
