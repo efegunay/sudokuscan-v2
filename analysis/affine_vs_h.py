@@ -146,7 +146,7 @@ def plot_all(rows, best_rect, outdir):
         for m in MODELS:
             _scatter(ax, x, [100 * r[f"{m}_cell_acc"] for r in rows], m)
         _axes(ax, "Obliqueness (max opposite-side ratio)", "Cell accuracy (%)")
-        ax.legend(frameon=False, loc="lower left")
+        ax.legend(frameon=False, loc="lower center", bbox_to_anchor=(0.5, 1.0), ncol=3)
         fig.tight_layout()
         fig.savefig(outdir / "fig_cell_accuracy.png", dpi=300)
         plt.close(fig)
