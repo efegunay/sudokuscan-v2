@@ -7,6 +7,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import pytesseract
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 
@@ -173,8 +174,101 @@ def rectify(image_bgr, corners):
     }
 
 
+CELL = RECT_SIZE // 9
+CELL_MARGIN = 7
+RECT_BACKGROUND_KERNEL = 15
+RECT_INK_LEVEL = 0.75
+EMPTY_MIN_AREA = 0.03
+EMPTY_MIN_HEIGHT = 0.35
+OCR_HEIGHT = 48
+OCR_PAD = 20
+OCR_CONFIG = "--psm 10 --oem 1 -c tessedit_char_whitelist=123456789"
+OCR_FALLBACK_CONFIG = "--psm 13 --oem 1 -c tessedit_char_whitelist=123456789"
+
+
+def rect_ink(rect_bgr):
+    grey = cv2.cvtColor(rect_bgr, cv2.COLOR_BGR2GRAY)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (RECT_BACKGROUND_KERNEL, RECT_BACKGROUND_KERNEL))
+    background = cv2.morphologyEx(grey, cv2.MORPH_CLOSE, kernel)
+    background = cv2.GaussianBlur(background, (RECT_BACKGROUND_KERNEL, RECT_BACKGROUND_KERNEL), 0)
+    flat = np.clip(grey.astype(np.float32) / np.maximum(background.astype(np.float32), 1.0), 0.0, 1.0)
+    return grey, flat, (flat < RECT_INK_LEVEL).astype(np.uint8)
+
+
+def cell_box(row, col, margin=CELL_MARGIN):
+    y0, x0 = row * CELL, col * CELL
+    return y0 + margin, y0 + CELL - margin, x0 + margin, x0 + CELL - margin
+
+
+def digit_mask(ink_crop):
+    h, w = ink_crop.shape
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(ink_crop, connectivity=8)
+    best, best_area = 0, 0
+    for i in range(1, n):
+        x, y, cw, ch, area = stats[i]
+        touches = x == 0 or y == 0 or x + cw == w or y + ch == h
+        line_like = cw <= 0.15 * w or ch <= 0.15 * h
+        if touches and line_like:
+            continue
+        if area > best_area:
+            best, best_area = i, area
+    if best == 0:
+        return None
+    x, y, cw, ch, area = stats[best]
+    if area < EMPTY_MIN_AREA * h * w or ch < EMPTY_MIN_HEIGHT * h:
+        return None
+    mask = labels == best
+    for i in range(1, n):
+        if i == best:
+            continue
+        xi, yi, wi, hi, _ = stats[i]
+        cx, cy = xi + wi / 2, yi + hi / 2
+        if x <= cx <= x + cw and y - 0.2 * ch <= cy <= y + 1.2 * ch:
+            mask |= labels == i
+    return mask
+
+
+def prepare_for_ocr(flat_crop, mask):
+    ys, xs = np.nonzero(mask)
+    y0, y1 = max(0, ys.min() - 1), ys.max() + 2
+    x0, x1 = max(0, xs.min() - 1), xs.max() + 2
+    keep = cv2.dilate(mask.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+    digit = np.where(keep, flat_crop, 1.0)[y0:y1, x0:x1]
+    width = max(1, int(round(digit.shape[1] * OCR_HEIGHT / digit.shape[0])))
+    digit = cv2.resize(digit, (width, OCR_HEIGHT), interpolation=cv2.INTER_CUBIC)
+    digit = (np.clip((digit - 0.25) / 0.6, 0.0, 1.0) * 255).astype(np.uint8)
+    return cv2.copyMakeBorder(digit, OCR_PAD, OCR_PAD, OCR_PAD, OCR_PAD, cv2.BORDER_CONSTANT, value=255)
+
+
+def ocr_digit(image):
+    for config in (OCR_CONFIG, OCR_FALLBACK_CONFIG):
+        text = pytesseract.image_to_string(image, config=config)
+        digits = [ch for ch in text if ch in "123456789"]
+        if digits:
+            return int(digits[0])
+    return 0
+
+
+def read_cells(rect_bgr, prepare=True):
+    grey, flat, ink = rect_ink(rect_bgr)
+    grid, crops = [], {}
+    for r in range(9):
+        row = []
+        for c in range(9):
+            y0, y1, x0, x1 = cell_box(r, c)
+            mask = digit_mask(ink[y0:y1, x0:x1])
+            if mask is None:
+                row.append(0)
+                continue
+            crop = prepare_for_ocr(flat[y0:y1, x0:x1], mask) if prepare else grey[y0:y1, x0:x1]
+            crops[(r, c)] = crop
+            row.append(ocr_digit(crop))
+        grid.append(row)
+    return grid, crops
+
+
 def read_grid(rectified_h4):
-    raise NotImplementedError("Stage 5")
+    return read_cells(rectified_h4)[0]
 
 
 def check_validity(grid):
@@ -197,6 +291,7 @@ def run_pipeline(image_bgr, debug):
     fields.update({key: rect[key] for key in ("A3", "A4", "H4", "a3_corner_err_px", "a4_rms_px")})
 
     grid = read_grid(rect["H4_image"])
+    fields["grid"] = grid
     verdict, conflicts = check_validity(grid)
     return {**fields, "grid": grid, "verdict": verdict}
 
