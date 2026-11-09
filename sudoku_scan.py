@@ -271,8 +271,28 @@ def read_grid(rectified_h4):
     return read_cells(rectified_h4)[0]
 
 
+def sudoku_units():
+    rows = [[(r, c) for c in range(9)] for r in range(9)]
+    cols = [[(r, c) for r in range(9)] for c in range(9)]
+    boxes = [[(br * 3 + i, bc * 3 + j) for i in range(3) for j in range(3)]
+             for br in range(3) for bc in range(3)]
+    return rows + cols + boxes
+
+
 def check_validity(grid):
-    raise NotImplementedError("Stage 6")
+    conflicts = set()
+    for unit in sudoku_units():
+        seen = {}
+        for r, c in unit:
+            digit = grid[r][c]
+            if digit == 0:
+                continue
+            seen.setdefault(digit, []).append((r, c))
+        for cells in seen.values():
+            if len(cells) > 1:
+                conflicts.update(cells)
+    verdict = "invalid" if conflicts else "valid"
+    return verdict, sorted(conflicts)
 
 
 def run_pipeline(image_bgr, debug):
@@ -293,6 +313,7 @@ def run_pipeline(image_bgr, debug):
     grid = read_grid(rect["H4_image"])
     fields["grid"] = grid
     verdict, conflicts = check_validity(grid)
+    debug.update(grid=grid, verdict=verdict, conflicts=conflicts)
     return {**fields, "grid": grid, "verdict": verdict}
 
 
@@ -332,6 +353,45 @@ def write_rect_images(outdir, stem, debug):
         cv2.imwrite(str(outdir / f"{stem}_rect_{model}.png"), debug["rect"][f"{model}_image"])
 
 
+DEBUG_SCALE = 2
+
+
+def write_debug_image(outdir, stem, debug):
+    if "rect" not in debug or "grid" not in debug:
+        return
+    s = DEBUG_SCALE
+    size = RECT_SIZE * s
+    vis = cv2.resize(debug["rect"]["H4_image"], (size, size), interpolation=cv2.INTER_LINEAR)
+    vis = cv2.addWeighted(vis, 0.55, np.full_like(vis, 255), 0.45, 0)
+    conflicts = set(debug.get("conflicts", []))
+    overlay = vis.copy()
+    for r, c in conflicts:
+        cv2.rectangle(overlay, (c * CELL * s, r * CELL * s), ((c + 1) * CELL * s, (r + 1) * CELL * s), (60, 60, 230), -1)
+    vis = cv2.addWeighted(overlay, 0.35, vis, 0.65, 0)
+    for k in range(10):
+        p = k * CELL * s
+        thick = 3 if k % 3 == 0 else 1
+        cv2.line(vis, (p, 0), (p, size), (200, 120, 40), thick)
+        cv2.line(vis, (0, p), (size, p), (200, 120, 40), thick)
+    for r in range(9):
+        for c in range(9):
+            digit = debug["grid"][r][c]
+            if digit == 0:
+                continue
+            colour = (0, 0, 200) if (r, c) in conflicts else (150, 60, 0)
+            org = (c * CELL * s + 8, r * CELL * s + 30)
+            cv2.putText(vis, str(digit), org, cv2.FONT_HERSHEY_SIMPLEX, 0.9, colour, 2, cv2.LINE_AA)
+    banner_h = 44
+    verdict = debug.get("verdict", "")
+    text = f"{verdict.upper()}"
+    if conflicts:
+        text += "  conflicts: " + " ".join(f"r{r + 1}c{c + 1}" for r, c in sorted(conflicts))
+    banner = np.full((banner_h, size, 3), 255, np.uint8)
+    colour = (0, 140, 0) if verdict == "valid" else (0, 0, 200)
+    cv2.putText(banner, text[:90], (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, colour, 2, cv2.LINE_AA)
+    cv2.imwrite(str(outdir / f"{stem}_debug.png"), np.vstack([banner, vis]))
+
+
 def write_result(outdir, stem, result):
     with open(outdir / f"{stem}_result.json", "w") as f:
         json.dump(result, f, indent=2)
@@ -359,6 +419,7 @@ def process_image(path, outdir):
     write_result(outdir, path.stem, result)
     write_harris_image(outdir, path.stem, debug)
     write_rect_images(outdir, path.stem, debug)
+    write_debug_image(outdir, path.stem, debug)
     print(f"[{path.name}] {result['verdict']} in {result['runtime_s']:.2f}s")
     return result
 
