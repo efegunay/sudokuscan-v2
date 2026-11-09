@@ -23,6 +23,8 @@ NMS_FRAC = 0.008
 INK_LEVEL = 220
 MIN_PUZZLE_AREA = 0.02
 SNAP_RADIUS_CELLS = 0.25
+GRID_SCORE_WINDOW = 6
+BOX_SCORE_MIN = 0.6
 
 
 class PuzzleNotFound(Exception):
@@ -78,15 +80,29 @@ def order_corners(quad):
     return np.roll(quad, -int(np.argmin(np.abs(diff))), axis=0)
 
 
-def grid_score(binary, quad):
+def line_evidence(binary, quad):
     target = np.float32([[0, 0], [450, 0], [450, 450], [0, 450]])
     warp = cv2.warpPerspective(binary, cv2.getPerspectiveTransform(quad, target), (451, 451))
     ink = warp.astype(np.float32) / 255.0
-    rows, cols = ink.mean(axis=1), ink.mean(axis=0)
-    lines = np.arange(0, 451, 50)
-    on = [p[max(0, i - 3):i + 4].max() for p in (rows, cols) for i in lines]
-    off = [p[i + 15:i + 36].mean() for p in (rows, cols) for i in lines[:-1]]
-    return float(np.clip(np.median(on) - 2 * np.mean(off), 0.0, 1.0))
+    on = np.zeros((2, 9, 10), np.float32)
+    for o, img in enumerate((ink, ink.T)):
+        for j in range(9):
+            profile = img[:, 50 * j + 10:50 * j + 40].mean(axis=1)
+            for k in range(10):
+                i = 50 * k
+                on[o, j, k] = profile[max(0, i - GRID_SCORE_WINDOW):i + GRID_SCORE_WINDOW + 1].max()
+    off = ink[:450, :450].reshape(9, 50, 9, 50)[:, 15:35, :, 15:35].mean()
+    return on, off
+
+
+def grid_score(binary, quad):
+    on, off = line_evidence(binary, quad)
+    return float(np.clip(np.median(on) - 2 * off, 0.0, 1.0))
+
+
+def box_score(binary, quad):
+    on, _ = line_evidence(binary, quad)
+    return float(min(np.median(on[:, :, k]) for k in (0, 3, 6, 9)))
 
 
 def puzzle_region(prepared):
@@ -94,8 +110,10 @@ def puzzle_region(prepared):
     contours, _ = cv2.findContours(binary, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     min_area = MIN_PUZZLE_AREA * prepared.shape[0] * prepared.shape[1]
     best, best_score = None, 0.0
+    boxed, boxed_score = None, BOX_SCORE_MIN
     for contour in contours:
-        if cv2.contourArea(contour) < min_area:
+        area = cv2.contourArea(contour)
+        if area < min_area:
             continue
         hull = cv2.convexHull(contour)
         quad = cv2.approxPolyDP(hull, 0.02 * cv2.arcLength(hull, True), True)
@@ -105,6 +123,11 @@ def puzzle_region(prepared):
         score = grid_score(binary, quad)
         if score > best_score:
             best, best_score = quad, score
+        boxes = box_score(binary, quad)
+        if boxes >= boxed_score:
+            boxed, boxed_score = quad, boxes
+    if boxed is not None:
+        return boxed
     return best
 
 
